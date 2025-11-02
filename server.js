@@ -12,7 +12,7 @@ app.use(express.json());
 
 const API_KEY = process.env.ES_API_KEY;
 
-// 🔒 API Key protection
+// API Key protection
 app.use((req, res, next) => {
   const key = req.headers["x-api-key"];
   if (!key || key !== API_KEY) {
@@ -23,14 +23,14 @@ app.use((req, res, next) => {
 
 const upload = multer({ dest: "uploads/" });
 
-// 🎥 API endpoint: Convert video → high-quality GIF
+// API endpoint: Convert video → high-quality GIF
 app.post("/convert", upload.single("video"), (req, res) => {
   if (!req.file) return res.status(400).send("No video file uploaded.");
 
   const inputPath = req.file.path;
   const outputFile = `output_${Date.now()}.gif`;
 
-  // ⚙️ FFmpeg settings: sharp, smooth & looped GIF
+  // FFmpeg settings: sharp, smooth & looped GIF
   ffmpeg(inputPath)
     .outputOptions([
       "-vf", "fps=15,scale=480:-1:flags=lanczos", // smooth & detailed
@@ -53,7 +53,7 @@ app.post("/convert", upload.single("video"), (req, res) => {
     .save(outputFile);
 });
 
-// 🔹 Test route
+// Test route
 app.get("/", (req, res) => {
   res.send("✅ Video to GIF API running successfully — use /convert endpoint");
 });
