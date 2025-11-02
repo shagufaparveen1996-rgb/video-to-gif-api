@@ -3,10 +3,23 @@ import multer from "multer";
 import ffmpeg from "fluent-ffmpeg";
 import fs from "fs";
 import cors from "cors";
+import dotenv from "dotenv";
+dotenv.config();
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+const API_KEY = process.env.ES_API_KEY;
+
+// 🔒 API Key protection
+app.use((req, res, next) => {
+  const key = req.headers["x-api-key"];
+  if (!key || key !== API_KEY) {
+    return res.status(403).json({ error: "Unauthorized" });
+  }
+  next();
+});
 
 const upload = multer({ dest: "uploads/" });
 
