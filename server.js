@@ -23,34 +23,74 @@ app.use((req, res, next) => {
 
 const upload = multer({ dest: "uploads/" });
 
-// API endpoint: Convert video → high-quality GIF
+// API endpoint: Convert video → high-quality, dynamic GIF
 app.post("/convert", upload.single("video"), (req, res) => {
   if (!req.file) return res.status(400).send("No video file uploaded.");
 
   const inputPath = req.file.path;
   const outputFile = `output_${Date.now()}.gif`;
 
-  // FFmpeg settings: sharp, smooth & looped GIF
+  // Dynamic values from frontend (or defaults)
+  const fps = req.body.fps ? parseInt(req.body.fps) : 15;
+  const quality = req.body.quality || "medium"; // low | medium | high
+  const size = req.body.size || "480"; // 480 | 720 | 1080
+
+  // Dynamic scale
+  let scale;
+  if (size === "1080") scale = "1080:-1";
+  else if (size === "720") scale = "720:-1";
+  else scale = "480:-1";
+
+  // Dithering & color optimization based on quality
+  let dither = "bayer";
+  if (quality === "high") dither = "floyd_steinberg";
+  if (quality === "low") dither = "none";
+
+  // Generate temporary palette
+  const palettePath = `palette_${Date.now()}.png`;
+
+  console.log("🎬 Starting conversion with settings:", { fps, scale, dither });
+
+  // Step 1: Generate color palette
   ffmpeg(inputPath)
     .outputOptions([
-      "-vf", "fps=15,scale=480:-1:flags=lanczos", // smooth & detailed
-      "-loop", "0" // infinite loop
+      "-vf",
+      `fps=${fps},scale=${scale}:flags=lanczos,palettegen=stats_mode=diff`
     ])
-    .toFormat("gif")
-    .on("start", (cmd) => console.log("FFmpeg command:", cmd))
-    .on("error", (err) => {
-      console.error("FFmpeg error:", err.message);
-      res.status(500).send("Video conversion failed");
-      fs.unlinkSync(inputPath);
-    })
     .on("end", () => {
-      console.log("✅ Conversion done:", outputFile);
-      res.download(outputFile, () => {
-        fs.unlinkSync(inputPath);
-        fs.unlinkSync(outputFile);
-      });
+      // Step 2: Use palette for better color accuracy
+      ffmpeg(inputPath)
+        .input(palettePath)
+        .complexFilter(
+          `[0:v]fps=${fps},scale=${scale}:flags=lanczos[x];[x][1:v]paletteuse=dither=${dither}`
+        )
+        .outputOptions(["-loop", "0"])
+        .toFormat("gif")
+        .on("start", (cmd) => console.log("⚙️ FFmpeg command:", cmd))
+        .on("error", (err) => {
+          console.error("❌ FFmpeg error:", err.message);
+          res.status(500).send("Video conversion failed");
+          cleanup();
+        })
+        .on("end", () => {
+          console.log("✅ Conversion done:", outputFile);
+          res.download(outputFile, () => cleanup());
+        })
+        .save(outputFile);
     })
-    .save(outputFile);
+    .on("error", (err) => {
+      console.error("❌ Palette generation error:", err.message);
+      res.status(500).send("Palette generation failed");
+      cleanup();
+    })
+    .save(palettePath);
+
+  // Clean up temp files
+  function cleanup() {
+    [inputPath, outputFile, palettePath].forEach((file) => {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    });
+  }
 });
 
 // Test route
