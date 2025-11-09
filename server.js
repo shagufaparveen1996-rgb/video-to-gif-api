@@ -34,6 +34,7 @@ app.post("/convert", upload.single("video"), (req, res) => {
   const fps = req.body.fps ? parseInt(req.body.fps) : 15;
   const quality = req.body.quality || "medium"; // low | medium | high
   const size = req.body.size || "480"; // 480 | 720 | 1080
+  const loop = req.body.loop !== undefined ? (req.body.loop === '1' || req.body.loop === 1 || req.body.loop === true) : true; // Default to true (loop enabled)
 
   // Dynamic scale
   let scale;
@@ -49,7 +50,10 @@ app.post("/convert", upload.single("video"), (req, res) => {
   // Generate temporary palette
   const palettePath = `palette_${Date.now()}.png`;
 
-  console.log("🎬 Starting conversion with settings:", { fps, scale, dither });
+  // Set loop value: 0 = infinite loop, -1 = no loop (plays once)
+  const loopValue = loop ? "0" : "-1";
+
+  console.log("🎬 Starting conversion with settings:", { fps, scale, dither, loop: loopValue });
 
   // Step 1: Generate color palette
   ffmpeg(inputPath)
@@ -64,7 +68,7 @@ app.post("/convert", upload.single("video"), (req, res) => {
         .complexFilter(
           `[0:v]fps=${fps},scale=${scale}:flags=lanczos[x];[x][1:v]paletteuse=dither=${dither}`
         )
-        .outputOptions(["-loop", "0"])
+        .outputOptions(["-loop", loopValue])
         .toFormat("gif")
         .on("start", (cmd) => console.log("⚙️ FFmpeg command:", cmd))
         .on("error", (err) => {
