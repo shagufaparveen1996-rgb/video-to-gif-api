@@ -16,8 +16,10 @@ const API_KEY = process.env.ES_API_KEY;
 // API Key protection
 app.use((req, res, next) => {
   const key = req.headers["x-api-key"];
+  console.log("🔑 API Key check - Received:", key ? "Present" : "Missing", "Expected:", API_KEY ? "Set" : "Not Set");
   if (!key || key !== API_KEY) {
-    return res.status(403).json({ error: "Unauthorized" });
+    console.error("❌ Unauthorized request - Key mismatch or missing");
+    return res.status(403).json({ error: "Unauthorized - Invalid or missing API key" });
   }
   next();
 });
@@ -28,20 +30,53 @@ const upload = multer({
   preservePath: true // Important: ensures text fields are parsed correctly
 });
 
+// Handle multer errors
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError) {
+    console.error("❌ Multer error:", error.message);
+    if (error.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: "File size exceeds 50MB limit. Please choose a smaller video file." });
+    }
+    return res.status(400).json({ error: "File upload error: " + error.message });
+  }
+  next(error);
+});
+
 
 // API endpoint: Convert video → high-quality, dynamic GIF
 app.post("/convert", upload.single("video"), (req, res) => {
   // Add error handler to prevent crashes
   try {
+    console.log("📨 POST /convert received");
+    console.log("📋 Headers:", {
+      contentType: req.headers["content-type"],
+      contentLength: req.headers["content-length"],
+      hasFile: !!req.file
+    });
+    
     if (!req.file) {
-      return res.status(400).json({ error: "No video file uploaded." });
+      console.error("❌ No file in request");
+      console.error("📋 Request body keys:", Object.keys(req.body || {}));
+      console.error("📋 Files:", Object.keys(req.files || {}));
+      return res.status(400).json({ error: "No video file uploaded. Please ensure the file field is named 'video'." });
     }
 
     const inputPath = req.file.path;
     
     // Check if input file exists
     if (!fs.existsSync(inputPath)) {
-      return res.status(400).json({ error: "Uploaded file not found." });
+      console.error("❌ File not found at path:", inputPath);
+      console.error("📁 File object:", req.file);
+      return res.status(400).json({ error: "Uploaded file not found. Path: " + inputPath });
+    }
+    
+    // Check file size
+    const fileStats = fs.statSync(inputPath);
+    console.log("📊 File stats:", { size: fileStats.size, path: inputPath });
+    
+    if (fileStats.size === 0) {
+      console.error("❌ File is empty");
+      return res.status(400).json({ error: "Uploaded file is empty. Please upload a valid video file." });
     }
     
     const outputFile = `output_${Date.now()}.gif`;
@@ -304,7 +339,25 @@ app.post("/convert", upload.single("video"), (req, res) => {
             })
             .on("end", () => {
               if (!res.headersSent) {
-                res.download(outputFile, () => cleanup());
+                // Check if output file exists
+                if (!fs.existsSync(outputFile)) {
+                  console.error("❌ Output file not found:", outputFile);
+                  return res.status(500).json({ error: "Conversion completed but output file not found." });
+                }
+                
+                // Send GIF file with proper headers
+                res.setHeader('Content-Type', 'image/gif');
+                res.setHeader('Content-Disposition', `attachment; filename="converted_${Date.now()}.gif"`);
+                const fileStream = fs.createReadStream(outputFile);
+                fileStream.pipe(res);
+                fileStream.on('end', () => cleanup());
+                fileStream.on('error', (err) => {
+                  console.error("❌ Error streaming file:", err);
+                  if (!res.headersSent) {
+                    res.status(500).json({ error: "Error sending converted file." });
+                  }
+                  cleanup();
+                });
               } else {
                 cleanup();
               }
