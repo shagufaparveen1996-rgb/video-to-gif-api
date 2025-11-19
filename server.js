@@ -269,15 +269,34 @@ app.post("/convert", upload.single("video"), (req, res) => {
       // Only set duration if it's valid and less than remaining video
       const remainingDuration = actualDuration - finalStartTime;
       const safeDuration = Math.min(finalDuration, remainingDuration);
-      if (safeDuration >= 1.0 && safeDuration <= 600) {
-        paletteFfmpeg.duration(safeDuration);
-      } else {
-        console.error("❌ Invalid duration calculated:", safeDuration);
+      
+      console.log("🔢 Duration calculations:", {
+        actualDuration,
+        finalStartTime,
+        finalEndTime,
+        finalDuration,
+        remainingDuration,
+        safeDuration
+      });
+      
+      if (safeDuration < 1.0) {
+        console.error("❌ Safe duration too short:", safeDuration);
         if (!res.headersSent) {
-          return res.status(400).json({ error: "Invalid video duration. Please try a different video." });
+          return res.status(400).json({ error: `Cannot extract valid duration from video. Video duration: ${actualDuration.toFixed(2)}s, Requested: ${startTime.toFixed(2)}s to ${endTime.toFixed(2)}s. Please adjust the time range.` });
         }
         return cleanup();
       }
+      
+      if (safeDuration > 600) {
+        console.error("❌ Safe duration too long:", safeDuration);
+        if (!res.headersSent) {
+          return res.status(400).json({ error: "Requested duration exceeds maximum allowed (600 seconds)." });
+        }
+        return cleanup();
+      }
+      
+      // Set duration for palette generation
+      paletteFfmpeg.duration(safeDuration);
       
       // Optimize for speed - palettegen outputs PNG automatically
       console.log("🎨 Starting palette generation with filter:", paletteFilter);
@@ -306,20 +325,28 @@ app.post("/convert", upload.single("video"), (req, res) => {
           const convertFfmpeg = ffmpeg(inputPath);
           
           // Add trim options for conversion - use same values as palette
-          const remainingDuration = actualDuration - finalStartTime;
-          const safeDuration = Math.min(finalDuration, remainingDuration);
+          const remainingDurationForConversion = actualDuration - finalStartTime;
+          const safeDurationForConversion = Math.min(finalDuration, remainingDurationForConversion);
+          
+          console.log("🔢 Conversion duration:", {
+            safeDurationForConversion,
+            remainingDurationForConversion,
+            finalDuration
+          });
+          
           if (finalStartTime > 0 && finalStartTime < actualDuration) {
             convertFfmpeg.seekInput(finalStartTime);
           }
-          if (safeDuration >= 1.0 && safeDuration <= 600) {
-            convertFfmpeg.duration(safeDuration);
-          } else {
-            console.error("❌ Invalid duration for conversion:", safeDuration);
+          
+          if (safeDurationForConversion < 1.0) {
+            console.error("❌ Invalid duration for conversion:", safeDurationForConversion);
             if (!res.headersSent) {
-              return res.status(400).json({ error: "Invalid video duration for conversion." });
+              return res.status(400).json({ error: `Invalid duration for conversion (${safeDurationForConversion.toFixed(2)}s). Please try a different video or adjust time range.` });
             }
             return cleanup();
           }
+          
+          convertFfmpeg.duration(safeDurationForConversion);
           
           // Optimize for speed
           convertFfmpeg
