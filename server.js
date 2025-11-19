@@ -30,10 +30,14 @@ const upload = multer({
 
 // API endpoint: Convert video → high-quality, dynamic GIF
 app.post("/convert", upload.single("video"), (req, res) => {
-  if (!req.file) return res.status(400).send("No video file uploaded.");
+  // Add error handler to prevent crashes
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "No video file uploaded." });
+    }
 
-  const inputPath = req.file.path;
-  const outputFile = `output_${Date.now()}.gif`;
+    const inputPath = req.file.path;
+    const outputFile = `output_${Date.now()}.gif`;
 
   // Dynamic values from frontend (or defaults) - ensure we parse them correctly
   // Multer parses text fields as strings, so we need to convert them
@@ -76,7 +80,14 @@ app.post("/convert", upload.single("video"), (req, res) => {
     endTime = 60;
   }
   
-  const duration = Math.max(0.1, endTime - startTime);
+  // Calculate duration and ensure minimum 0.5 seconds for stable conversion
+  let duration = endTime - startTime;
+  if (duration < 0.5) {
+    console.warn("⚠️ Duration too short:", duration, "adjusting to minimum 0.5 seconds");
+    duration = 0.5;
+    endTime = startTime + 0.5;
+  }
+  duration = Math.max(0.5, Math.min(duration, 600));
   
   // Parse loop parameter - handle string '1'/'0', number 1/0, or boolean
   let loop = true; // Default to true
@@ -133,15 +144,18 @@ app.post("/convert", upload.single("video"), (req, res) => {
   // Create ffmpeg instance for palette generation
   const paletteFfmpeg = ffmpeg(inputPath);
   
+  // Use validated duration (already validated above)
+  const validDuration = duration;
+  
   // Add trim options if startTime > 0 or endTime < video duration
   if (startTime > 0) {
     paletteFfmpeg.seekInput(startTime);
   }
-  if (duration > 0 && duration < 600) {
-    paletteFfmpeg.duration(duration);
+  if (validDuration > 0 && validDuration < 600) {
+    paletteFfmpeg.duration(validDuration);
   }
   
-  // Optimize for speed
+  // Optimize for speed - palettegen outputs PNG automatically
   paletteFfmpeg
     .outputOptions([
       "-vf", paletteFilter,
@@ -156,12 +170,12 @@ app.post("/convert", upload.single("video"), (req, res) => {
       // Create ffmpeg instance for conversion
       const convertFfmpeg = ffmpeg(inputPath);
       
-      // Add trim options for conversion
+      // Add trim options for conversion - use validated duration
       if (startTime > 0) {
         convertFfmpeg.seekInput(startTime);
       }
-      if (duration > 0 && duration < 600) {
-        convertFfmpeg.duration(duration);
+      if (validDuration > 0 && validDuration < 600) {
+        convertFfmpeg.duration(validDuration);
       }
       
       // Optimize for speed
@@ -175,32 +189,69 @@ app.post("/convert", upload.single("video"), (req, res) => {
         .toFormat("gif")
         .on("error", (err) => {
           console.error("❌ FFmpeg error:", err.message);
-          res.status(500).send("Video conversion failed");
+          if (!res.headersSent) {
+            res.status(500).json({ error: "Video conversion failed: " + err.message });
+          }
           cleanup();
         })
         .on("end", () => {
-          res.download(outputFile, () => cleanup());
+          if (!res.headersSent) {
+            res.download(outputFile, (err) => {
+              if (err) {
+                console.error("❌ Download error:", err.message);
+                if (!res.headersSent) {
+                  res.status(500).json({ error: "Failed to send GIF file" });
+                }
+              }
+              cleanup();
+            });
+          } else {
+            cleanup();
+          }
         })
         .save(outputFile);
     })
     .on("error", (err) => {
       console.error("❌ Palette generation error:", err.message);
-      res.status(500).send("Palette generation failed");
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Palette generation failed: " + err.message });
+      }
       cleanup();
     })
     .save(palettePath);
 
   // Clean up temp files
   function cleanup() {
-    [inputPath, outputFile, palettePath].forEach((file) => {
-      if (fs.existsSync(file)) fs.unlinkSync(file);
-    });
+    try {
+      [inputPath, outputFile, palettePath].forEach((file) => {
+        if (fs.existsSync(file)) {
+          fs.unlinkSync(file);
+        }
+      });
+    } catch (cleanupErr) {
+      console.error("❌ Cleanup error:", cleanupErr.message);
+    }
+  }
+  } catch (error) {
+    console.error("❌ Server error:", error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Server error: " + error.message });
+    }
   }
 });
 
 // Test route
 app.get("/", (req, res) => {
   res.send("✅ Video to GIF API running successfully — use /convert endpoint");
+});
+
+// Global error handler to prevent crashes
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 app.listen(10000, () => console.log("🚀 Server running on port 10000"));
