@@ -2,15 +2,9 @@ import express from "express";
 import multer from "multer";
 import ffmpeg from "fluent-ffmpeg";
 import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import cors from "cors";
 import dotenv from "dotenv";
 dotenv.config();
-
-// Get __dirname equivalent for ES modules
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
@@ -30,7 +24,6 @@ app.use((req, res, next) => {
 
 const upload = multer({ 
   dest: "uploads/",
-  // Ensure text fields are parsed
   preservePath: true
 });
 
@@ -43,19 +36,13 @@ app.post("/convert", upload.single("video"), (req, res) => {
     }
 
     const inputPath = req.file.path;
-    const outputFile = path.join(__dirname, `output_${Date.now()}.gif`);
     
-    // Validate input file exists
+    // Check if input file exists
     if (!fs.existsSync(inputPath)) {
-      console.error("❌ Input file not found:", inputPath);
-      return res.status(400).json({ error: "Uploaded file not found" });
+      return res.status(400).json({ error: "Uploaded file not found." });
     }
     
-    console.log("📥 Processing video:", {
-      inputPath,
-      outputFile,
-      fileSize: fs.statSync(inputPath).size
-    });
+    const outputFile = `output_${Date.now()}.gif`;
 
     // Dynamic values from frontend (or defaults) - ensure we parse them correctly
     // Multer parses text fields as strings, so we need to convert them
@@ -69,11 +56,13 @@ app.post("/convert", upload.single("video"), (req, res) => {
     let startTime = req.body.startTime ? parseFloat(String(req.body.startTime)) : 0;
     let endTime = req.body.endTime ? parseFloat(String(req.body.endTime)) : 60;
     
-    // Validate parsed values - cap FPS at 20 for faster conversion
-    if (isNaN(fps) || fps < 0 || fps > 20) {
+    // Validate parsed values - ensure minimum 5 FPS, cap at 20 for faster conversion
+    if (isNaN(fps) || fps < 5 || fps > 20) {
       console.warn("⚠️ Invalid FPS, using default 10");
       fps = 10;
     }
+    // Ensure minimum 5 FPS for stable conversion
+    fps = Math.max(5, Math.min(fps, 20));
     
     // Validate and parse size
     let sizeNum = parseInt(size) || 480;
@@ -98,14 +87,14 @@ app.post("/convert", upload.single("video"), (req, res) => {
       endTime = 60;
     }
     
-    // Calculate duration and ensure minimum 0.5 seconds for stable conversion
+    // Ensure minimum duration of 1 second for stable conversion
     let duration = endTime - startTime;
-    if (duration < 0.5) {
-      console.warn("⚠️ Duration too short:", duration, "adjusting to minimum 0.5 seconds");
-      duration = 0.5;
-      endTime = startTime + 0.5;
+    if (duration < 1.0) {
+      console.warn("⚠️ Duration too short:", duration, "adjusting to minimum 1 second");
+      duration = 1.0;
+      endTime = startTime + 1.0;
     }
-    duration = Math.max(0.5, Math.min(duration, 600));
+    duration = Math.max(1.0, Math.min(duration, 600));
     
     // Parse loop parameter - handle string '1'/'0', number 1/0, or boolean
     let loop = true; // Default to true
@@ -142,8 +131,8 @@ app.post("/convert", upload.single("video"), (req, res) => {
     // fast_bilinear is fastest, bilinear is faster, lanczos is best but slowest
     const scaleFlags = quality === "low" ? "flags=fast_bilinear" : quality === "medium" ? "flags=bilinear" : "flags=lanczos";
 
-    // Generate temporary palette - use absolute path
-    const palettePath = path.join(__dirname, `palette_${Date.now()}.png`);
+    // Generate temporary palette
+    const palettePath = `palette_${Date.now()}.png`;
 
     // Set loop value: 0 = infinite loop, -1 = no loop (plays once)
     const loopValue = loop ? "0" : "-1";
@@ -155,22 +144,25 @@ app.post("/convert", upload.single("video"), (req, res) => {
     const paletteSize = quality === "low" ? "128" : quality === "medium" ? "192" : "256";
     const statsMode = "single"; // Always use single for speed (diff is 2-3x slower)
     
+    // Ensure FPS is valid for palette generation (already validated above, but ensure here too)
+    const validFPS = Math.max(5, Math.min(fps, 20));
+    
     const paletteFilter = speedFilter 
-      ? `${speedFilter}fps=${fps},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`
-      : `fps=${fps},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`;
+      ? `${speedFilter}fps=${validFPS},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`
+      : `fps=${validFPS},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`;
     
     // Create ffmpeg instance for palette generation
     const paletteFfmpeg = ffmpeg(inputPath);
     
-    // Use validated duration (already validated above)
-    const validDuration = duration;
-    
     // Add trim options if startTime > 0 or endTime < video duration
+    // Ensure minimum 1 second duration
     if (startTime > 0) {
       paletteFfmpeg.seekInput(startTime);
     }
-    if (validDuration > 0 && validDuration < 600) {
-      paletteFfmpeg.duration(validDuration);
+    if (duration >= 1.0 && duration < 600) {
+      paletteFfmpeg.duration(duration);
+    } else if (duration < 1.0) {
+      paletteFfmpeg.duration(1.0); // Force minimum 1 second
     }
     
     // Optimize for speed - palettegen outputs PNG automatically
@@ -179,39 +171,25 @@ app.post("/convert", upload.single("video"), (req, res) => {
         "-vf", paletteFilter,
         "-threads", "0"  // Auto-detect optimal thread count
       ])
-      .on("start", (cmd) => {
-        console.log("🎨 Starting palette generation...");
-        console.log("📋 FFmpeg command:", cmd);
-      })
-      .on("progress", (progress) => {
-        console.log("📊 Palette progress:", progress.percent + "%");
-      })
       .on("end", () => {
-        console.log("✅ Palette generation completed");
-        
-        // Check if palette file was created
-        if (!fs.existsSync(palettePath)) {
-          console.error("❌ Palette file not created:", palettePath);
-          if (!res.headersSent) {
-            return res.status(500).json({ error: "Palette generation failed - file not created" });
-          }
-          return cleanup();
-        }
-        
         // Step 2: Use palette for better color accuracy
+        // Use validated FPS
         const conversionFilter = speedFilter
-          ? `[0:v]${speedFilter}fps=${fps},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`
-          : `[0:v]fps=${fps},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`;
+          ? `[0:v]${speedFilter}fps=${validFPS},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`
+          : `[0:v]fps=${validFPS},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`;
         
         // Create ffmpeg instance for conversion
         const convertFfmpeg = ffmpeg(inputPath);
         
-        // Add trim options for conversion - use validated duration
+        // Add trim options for conversion
+        // Ensure minimum 1 second duration
         if (startTime > 0) {
           convertFfmpeg.seekInput(startTime);
         }
-        if (validDuration > 0 && validDuration < 600) {
-          convertFfmpeg.duration(validDuration);
+        if (duration >= 1.0 && duration < 600) {
+          convertFfmpeg.duration(duration);
+        } else if (duration < 1.0) {
+          convertFfmpeg.duration(1.0); // Force minimum 1 second
         }
         
         // Optimize for speed
@@ -223,47 +201,16 @@ app.post("/convert", upload.single("video"), (req, res) => {
             "-threads", "0"  // Auto-detect optimal thread count
           ])
           .toFormat("gif")
-          .on("start", (cmd) => {
-            console.log("🎬 Starting GIF conversion...");
-            console.log("📋 FFmpeg command:", cmd);
-          })
-          .on("progress", (progress) => {
-            console.log("📊 Conversion progress:", progress.percent + "%");
-          })
           .on("error", (err) => {
             console.error("❌ FFmpeg error:", err.message);
-            console.error("❌ Error details:", err);
             if (!res.headersSent) {
-              res.status(500).json({ 
-                error: "Video conversion failed", 
-                message: err.message,
-                details: process.env.NODE_ENV === 'development' ? err.stack : undefined
-              });
+              res.status(500).json({ error: "Video conversion failed: " + err.message });
             }
             cleanup();
           })
           .on("end", () => {
-            // Check if output file was created
-            if (!fs.existsSync(outputFile)) {
-              console.error("❌ Output GIF file not created:", outputFile);
-              if (!res.headersSent) {
-                return res.status(500).json({ error: "GIF conversion failed - file not created" });
-              }
-              return cleanup();
-            }
-            
-            console.log("✅ GIF conversion completed:", outputFile);
-            
             if (!res.headersSent) {
-              res.download(outputFile, (err) => {
-                if (err) {
-                  console.error("❌ Download error:", err.message);
-                  if (!res.headersSent) {
-                    res.status(500).json({ error: "Failed to send GIF file" });
-                  }
-                }
-                cleanup();
-              });
+              res.download(outputFile, () => cleanup());
             } else {
               cleanup();
             }
@@ -272,13 +219,8 @@ app.post("/convert", upload.single("video"), (req, res) => {
       })
       .on("error", (err) => {
         console.error("❌ Palette generation error:", err.message);
-        console.error("❌ Error details:", err);
         if (!res.headersSent) {
-          res.status(500).json({ 
-            error: "Palette generation failed", 
-            message: err.message,
-            details: process.env.NODE_ENV === 'development' ? err.stack : undefined
-          });
+          res.status(500).json({ error: "Palette generation failed: " + err.message });
         }
         cleanup();
       })
@@ -298,13 +240,8 @@ app.post("/convert", upload.single("video"), (req, res) => {
     }
   } catch (error) {
     console.error("❌ Server error:", error.message);
-    console.error("❌ Error stack:", error.stack);
     if (!res.headersSent) {
-      res.status(500).json({ 
-        error: "Server error", 
-        message: error.message,
-        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
-      });
+      res.status(500).json({ error: "Server error: " + error.message });
     }
   }
 });
