@@ -8,9 +8,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-
-// Note: Don't use express.json() or urlencoded with multer
-// Multer parses multipart/form-data automatically
+app.use(express.json());
 
 const API_KEY = process.env.ES_API_KEY;
 
@@ -23,10 +21,7 @@ app.use((req, res, next) => {
   next();
 });
 
-const upload = multer({
-  dest: "uploads/",
-  preservePath: true
-});
+const upload = multer({ dest: "uploads/" });
 
 // API endpoint: Convert video → high-quality, dynamic GIF
 app.post("/convert", upload.single("video"), (req, res) => {
@@ -35,103 +30,54 @@ app.post("/convert", upload.single("video"), (req, res) => {
   const inputPath = req.file.path;
   const outputFile = `output_${Date.now()}.gif`;
 
-  // Debug logs
-  console.log("📦 Received size:", req.body.size, "type:", typeof req.body.size);
-
-  // Parse inputs
-  let fps = req.body.fps ? parseInt(String(req.body.fps)) : 15;
-  let quality =
-    req.body.quality && ["low", "medium", "high"].includes(String(req.body.quality))
-      ? String(req.body.quality)
-      : "medium";
-  let size = req.body.size ? String(req.body.size) : "480";
-  let speed = req.body.speed ? parseFloat(String(req.body.speed)) : 1.0;
-  let startTime = req.body.startTime ? parseFloat(String(req.body.startTime)) : 0;
-  let endTime = req.body.endTime ? parseFloat(String(req.body.endTime)) : 60;
-
-  // Validate inputs
-  if (isNaN(fps) || fps < 0 || fps > 30) fps = 15;
-
-  let sizeNum = parseInt(size) || 480;
-  if (isNaN(sizeNum) || sizeNum < 100 || sizeNum > 800) sizeNum = 480;
-  size = String(sizeNum);
-
-  if (isNaN(speed) || speed < 0.5 || speed > 2.0) speed = 1.0;
-  if (isNaN(startTime) || startTime < 0) startTime = 0;
-  if (isNaN(endTime) || endTime <= startTime) endTime = startTime + 60;
-
-  const duration = Math.max(0.1, endTime - startTime);
-
-  // Loop parsing
-  let loop = true;
-  if (req.body.loop !== undefined) {
-    const loopValue = req.body.loop;
-    if (loopValue === "0" || loopValue === 0 || loopValue === false || loopValue === "false") {
-      loop = false;
-    }
-  }
+  // Dynamic values from frontend (or defaults)
+  const fps = req.body.fps ? parseInt(req.body.fps) : 15;
+  const quality = req.body.quality || "medium"; // low | medium | high
+  const size = req.body.size || "480"; // 480 | 720 | 1080
+  const loop = req.body.loop !== undefined ? (req.body.loop === '1' || req.body.loop === 1 || req.body.loop === true) : true; // Default to true (loop enabled)
 
   // Dynamic scale
-  const clampedSize = Math.max(100, Math.min(800, sizeNum));
-  const scale = `${clampedSize}:-1`;
+  let scale;
+  if (size === "1080") scale = "1080:-1";
+  else if (size === "720") scale = "720:-1";
+  else scale = "480:-1";
 
-  // Speed filter
-  const clampedSpeed = Math.max(0.5, Math.min(2.0, speed));
-  let speedFilter = "";
-  if (clampedSpeed !== 1.0) {
-    const setptsValue = (1.0 / clampedSpeed).toFixed(4);
-    speedFilter = `setpts=${setptsValue}*PTS,`;
-  }
-
-  // Dithering
+  // Dithering & color optimization based on quality
   let dither = "bayer";
   if (quality === "high") dither = "floyd_steinberg";
-  if (quality === "low") dither = "bayer";
+  if (quality === "low") dither = "none";
 
-  const scaleFlags = quality === "low" ? "flags=bilinear" : "flags=lanczos";
+  // Generate temporary palette
   const palettePath = `palette_${Date.now()}.png`;
 
+  // Set loop value: 0 = infinite loop, -1 = no loop (plays once)
   const loopValue = loop ? "0" : "-1";
-  const paletteSize = "256";
-  const statsMode = quality === "low" ? "single" : "diff";
 
-  console.log("📏 Final scale:", scale);
+  console.log("🎬 Starting conversion with settings:", { fps, scale, dither, loop: loopValue });
 
-  const paletteFilter = speedFilter
-    ? `${speedFilter}fps=${fps},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`
-    : `fps=${fps},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`;
-
-  const paletteFfmpeg = ffmpeg(inputPath);
-
-  // Trim for palette
-  if (startTime > 0) paletteFfmpeg.seekInput(startTime);
-  if (duration > 0 && duration < 600) paletteFfmpeg.duration(duration);
-
-  paletteFfmpeg
-    .outputOptions(["-vf", paletteFilter, "-threads", "0"])
+  // Step 1: Generate color palette
+  ffmpeg(inputPath)
+    .outputOptions([
+      "-vf",
+      `fps=${fps},scale=${scale}:flags=lanczos,palettegen=stats_mode=diff`
+    ])
     .on("end", () => {
-      const conversionFilter = speedFilter
-        ? `[0:v]${speedFilter}fps=${fps},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`
-        : `[0:v]fps=${fps},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`;
-
-      console.log("🎨 Conversion filter:", conversionFilter);
-
-      const convertFfmpeg = ffmpeg(inputPath);
-
-      if (startTime > 0) convertFfmpeg.seekInput(startTime);
-      if (duration > 0 && duration < 600) convertFfmpeg.duration(duration);
-
-      convertFfmpeg
+      // Step 2: Use palette for better color accuracy
+      ffmpeg(inputPath)
         .input(palettePath)
-        .complexFilter(conversionFilter)
-        .outputOptions(["-loop", loopValue, "-threads", "0"])
+        .complexFilter(
+          `[0:v]fps=${fps},scale=${scale}:flags=lanczos[x];[x][1:v]paletteuse=dither=${dither}`
+        )
+        .outputOptions(["-loop", loopValue])
         .toFormat("gif")
+        .on("start", (cmd) => console.log("⚙️ FFmpeg command:", cmd))
         .on("error", (err) => {
           console.error("❌ FFmpeg error:", err.message);
           res.status(500).send("Video conversion failed");
           cleanup();
         })
         .on("end", () => {
+          console.log("✅ Conversion done:", outputFile);
           res.download(outputFile, () => cleanup());
         })
         .save(outputFile);
@@ -143,7 +89,7 @@ app.post("/convert", upload.single("video"), (req, res) => {
     })
     .save(palettePath);
 
-  // Cleanup temp files
+  // Clean up temp files
   function cleanup() {
     [inputPath, outputFile, palettePath].forEach((file) => {
       if (fs.existsSync(file)) fs.unlinkSync(file);
@@ -156,5 +102,4 @@ app.get("/", (req, res) => {
   res.send("✅ Video to GIF API running successfully — use /convert endpoint");
 });
 
-// Server start
 app.listen(10000, () => console.log("🚀 Server running on port 10000"));
