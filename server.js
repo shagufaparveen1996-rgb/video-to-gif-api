@@ -34,13 +34,11 @@ app.post("/convert", upload.single("video"), (req, res) => {
 
   const inputPath = req.file.path;
   const outputFile = `output_${Date.now()}.gif`;
-  
-  // Debug: Log received size value
-  console.log("📦 Received size from request:", req.body.size, "type:", typeof req.body.size);
 
   // Dynamic values from frontend (or defaults) - ensure we parse them correctly
   // Multer parses text fields as strings, so we need to convert them
-  let fps = req.body.fps ? parseInt(String(req.body.fps)) : 15;
+  // Lower default FPS for faster conversion
+  let fps = req.body.fps ? parseInt(String(req.body.fps)) : 10;
   let quality = (req.body.quality && ['low', 'medium', 'high'].includes(String(req.body.quality))) 
     ? String(req.body.quality) 
     : "medium";
@@ -49,10 +47,10 @@ app.post("/convert", upload.single("video"), (req, res) => {
   let startTime = req.body.startTime ? parseFloat(String(req.body.startTime)) : 0;
   let endTime = req.body.endTime ? parseFloat(String(req.body.endTime)) : 60;
   
-  // Validate parsed values
-  if (isNaN(fps) || fps < 0 || fps > 30) {
-    console.warn("⚠️ Invalid FPS, using default 15");
-    fps = 15;
+  // Validate parsed values - cap FPS at 20 for faster conversion
+  if (isNaN(fps) || fps < 0 || fps > 20) {
+    console.warn("⚠️ Invalid FPS, using default 10");
+    fps = 10;
   }
   
   // Validate and parse size
@@ -111,9 +109,9 @@ app.post("/convert", upload.single("video"), (req, res) => {
   if (quality === "high") dither = "floyd_steinberg";
   if (quality === "low") dither = "bayer"; // Keep bayer even for low quality
 
-  // Use balanced scaling algorithms - better quality with reasonable speed
-  // bilinear is good balance, lanczos is best quality
-  const scaleFlags = quality === "low" ? "flags=bilinear" : "flags=lanczos";
+  // Use faster scaling algorithms for speed
+  // fast_bilinear is fastest, bilinear is faster, lanczos is best but slowest
+  const scaleFlags = quality === "low" ? "flags=fast_bilinear" : quality === "medium" ? "flags=bilinear" : "flags=lanczos";
 
   // Generate temporary palette
   const palettePath = `palette_${Date.now()}.png`;
@@ -122,14 +120,11 @@ app.post("/convert", upload.single("video"), (req, res) => {
   const loopValue = loop ? "0" : "-1";
 
 
-  // Step 1: Generate color palette (balanced for quality and speed)
-  // Use stats_mode=diff for better quality (analyzes frame differences)
-  // Use full 256 colors for all quality levels for better color accuracy
-  const paletteSize = "256"; // Full palette for all quality levels
-  const statsMode = quality === "low" ? "single" : "diff"; // Use diff for medium/high quality
-  
-  // Debug: Log scale value to verify size is being used
-  console.log("📏 Scale value:", scale, "from size:", sizeNum, "clampedSize:", clampedSize);
+  // Step 1: Generate color palette (optimized for speed)
+  // Use stats_mode=single for all quality levels - much faster than diff
+  // Reduce palette colors for faster processing
+  const paletteSize = quality === "low" ? "128" : quality === "medium" ? "192" : "256";
+  const statsMode = "single"; // Always use single for speed (diff is 2-3x slower)
   
   const paletteFilter = speedFilter 
     ? `${speedFilter}fps=${fps},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`
@@ -157,9 +152,6 @@ app.post("/convert", upload.single("video"), (req, res) => {
       const conversionFilter = speedFilter
         ? `[0:v]${speedFilter}fps=${fps},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`
         : `[0:v]fps=${fps},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`;
-      
-      console.log("🎨 Conversion filter with scale:", conversionFilter);
-      console.log("📐 Final scale value:", scale, "clampedSize:", clampedSize);
       
       // Create ffmpeg instance for conversion
       const convertFfmpeg = ffmpeg(inputPath);
