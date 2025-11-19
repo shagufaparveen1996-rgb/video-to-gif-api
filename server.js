@@ -22,10 +22,12 @@ app.use((req, res, next) => {
   next();
 });
 
-const upload = multer({ 
+const upload = multer({
   dest: "uploads/",
-  preservePath: true
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+  preservePath: true // Important: ensures text fields are parsed correctly
 });
+
 
 // API endpoint: Convert video → high-quality, dynamic GIF
 app.post("/convert", upload.single("video"), (req, res) => {
@@ -43,7 +45,25 @@ app.post("/convert", upload.single("video"), (req, res) => {
     }
     
     const outputFile = `output_${Date.now()}.gif`;
+    const palettePath = `palette_${Date.now()}.png`;
 
+    // Clean up temp files
+    function cleanup() {
+      try {
+        [inputPath, outputFile, palettePath].forEach((file) => {
+          if (fs.existsSync(file)) {
+            fs.unlinkSync(file);
+          }
+        });
+      } catch (cleanupErr) {
+        console.error("❌ Cleanup error:", cleanupErr.message);
+      }
+    }
+
+    // Debug: Log received data
+    console.log("📥 Received request body:", req.body);
+    console.log("📁 File info:", req.file ? { name: req.file.originalname, size: req.file.size } : "No file");
+    
     // Dynamic values from frontend (or defaults) - ensure we parse them correctly
     // Multer parses text fields as strings, so we need to convert them
     // Lower default FPS for faster conversion
@@ -55,6 +75,8 @@ app.post("/convert", upload.single("video"), (req, res) => {
     let speed = req.body.speed ? parseFloat(String(req.body.speed)) : 1.0;
     let startTime = req.body.startTime ? parseFloat(String(req.body.startTime)) : 0;
     let endTime = req.body.endTime ? parseFloat(String(req.body.endTime)) : 60;
+    
+    console.log("⚙️ Parsed settings:", { fps, quality, size, speed, startTime, endTime });
     
     // Validate parsed values - ensure minimum 5 FPS, cap at 20 for faster conversion
     if (isNaN(fps) || fps < 5 || fps > 20) {
@@ -86,15 +108,6 @@ app.post("/convert", upload.single("video"), (req, res) => {
       console.warn("⚠️ Invalid endTime, using default 60");
       endTime = 60;
     }
-    
-    // Ensure minimum duration of 1 second for stable conversion
-    let duration = endTime - startTime;
-    if (duration < 1.0) {
-      console.warn("⚠️ Duration too short:", duration, "adjusting to minimum 1 second");
-      duration = 1.0;
-      endTime = startTime + 1.0;
-    }
-    duration = Math.max(1.0, Math.min(duration, 600));
     
     // Parse loop parameter - handle string '1'/'0', number 1/0, or boolean
     let loop = true; // Default to true
@@ -131,12 +144,8 @@ app.post("/convert", upload.single("video"), (req, res) => {
     // fast_bilinear is fastest, bilinear is faster, lanczos is best but slowest
     const scaleFlags = quality === "low" ? "flags=fast_bilinear" : quality === "medium" ? "flags=bilinear" : "flags=lanczos";
 
-    // Generate temporary palette
-    const palettePath = `palette_${Date.now()}.png`;
-
     // Set loop value: 0 = infinite loop, -1 = no loop (plays once)
     const loopValue = loop ? "0" : "-1";
-
 
     // Step 1: Generate color palette (optimized for speed)
     // Use stats_mode=single for all quality levels - much faster than diff
@@ -147,97 +156,174 @@ app.post("/convert", upload.single("video"), (req, res) => {
     // Ensure FPS is valid for palette generation (already validated above, but ensure here too)
     const validFPS = Math.max(5, Math.min(fps, 20));
     
-    const paletteFilter = speedFilter 
-      ? `${speedFilter}fps=${validFPS},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`
-      : `fps=${validFPS},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`;
-    
-    // Create ffmpeg instance for palette generation
-    const paletteFfmpeg = ffmpeg(inputPath);
-    
-    // Add trim options if startTime > 0 or endTime < video duration
-    // Ensure minimum 1 second duration
-    if (startTime > 0) {
-      paletteFfmpeg.seekInput(startTime);
-    }
-    if (duration >= 1.0 && duration < 600) {
-      paletteFfmpeg.duration(duration);
-    } else if (duration < 1.0) {
-      paletteFfmpeg.duration(1.0); // Force minimum 1 second
-    }
-    
-    // Optimize for speed - palettegen outputs PNG automatically
-    paletteFfmpeg
-      .outputOptions([
-        "-vf", paletteFilter,
-        "-threads", "0"  // Auto-detect optimal thread count
-      ])
-      .on("end", () => {
-        // Step 2: Use palette for better color accuracy
-        // Use validated FPS
-        const conversionFilter = speedFilter
-          ? `[0:v]${speedFilter}fps=${validFPS},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`
-          : `[0:v]fps=${validFPS},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`;
-        
-        // Create ffmpeg instance for conversion
-        const convertFfmpeg = ffmpeg(inputPath);
-        
-        // Add trim options for conversion
-        // Ensure minimum 1 second duration
-        if (startTime > 0) {
-          convertFfmpeg.seekInput(startTime);
-        }
-        if (duration >= 1.0 && duration < 600) {
-          convertFfmpeg.duration(duration);
-        } else if (duration < 1.0) {
-          convertFfmpeg.duration(1.0); // Force minimum 1 second
-        }
-        
-        // Optimize for speed
-        convertFfmpeg
-          .input(palettePath)
-          .complexFilter(conversionFilter)
-          .outputOptions([
-            "-loop", loopValue,
-            "-threads", "0"  // Auto-detect optimal thread count
-          ])
-          .toFormat("gif")
-          .on("error", (err) => {
-            console.error("❌ FFmpeg error:", err.message);
-            if (!res.headersSent) {
-              res.status(500).json({ error: "Video conversion failed: " + err.message });
-            }
-            cleanup();
-          })
-          .on("end", () => {
-            if (!res.headersSent) {
-              res.download(outputFile, () => cleanup());
-            } else {
-              cleanup();
-            }
-          })
-          .save(outputFile);
-      })
-      .on("error", (err) => {
-        console.error("❌ Palette generation error:", err.message);
+    // Get actual video duration first to prevent errors
+    console.log("🔍 Starting ffprobe for:", inputPath);
+    ffmpeg.ffprobe(inputPath, (err, metadata) => {
+      if (err) {
+        console.error("❌ Error getting video metadata:", err.message);
+        console.error("❌ Error stack:", err.stack);
         if (!res.headersSent) {
-          res.status(500).json({ error: "Palette generation failed: " + err.message });
+          return res.status(400).json({ error: "Could not read video file. Please ensure it's a valid video file. Error: " + err.message });
         }
-        cleanup();
-      })
-      .save(palettePath);
-
-    // Clean up temp files
-    function cleanup() {
-      try {
-        [inputPath, outputFile, palettePath].forEach((file) => {
-          if (fs.existsSync(file)) {
-            fs.unlinkSync(file);
-          }
-        });
-      } catch (cleanupErr) {
-        console.error("❌ Cleanup error:", cleanupErr.message);
+        return cleanup();
       }
-    }
+
+      if (!metadata || !metadata.format) {
+        console.error("❌ Invalid metadata received:", metadata);
+        if (!res.headersSent) {
+          return res.status(400).json({ error: "Could not read video metadata. Invalid video file." });
+        }
+        return cleanup();
+      }
+
+      const actualDuration = metadata.format.duration || 0;
+      
+      console.log("📹 Video duration:", actualDuration, "seconds");
+      console.log("📊 Video metadata:", {
+        duration: actualDuration,
+        size: metadata.format.size,
+        bitrate: metadata.format.bit_rate,
+        format: metadata.format.format_name
+      });
+      
+      // Check if video is too short
+      if (!actualDuration || actualDuration < 1.0) {
+        console.error("❌ Video too short:", actualDuration, "seconds");
+        if (!res.headersSent) {
+          return res.status(400).json({ error: `Video is too short (${actualDuration.toFixed(2)}s). Minimum duration required is 1 second.` });
+        }
+        return cleanup();
+      }
+
+      // Use actual video duration to limit requested duration
+      const maxAvailableDuration = Math.min(actualDuration, 60);
+      const finalStartTime = Math.max(0, Math.min(startTime, maxAvailableDuration - 1.0));
+      let finalEndTime = Math.min(endTime, maxAvailableDuration);
+      
+      // Ensure minimum 1 second duration
+      let finalDuration = finalEndTime - finalStartTime;
+      if (finalDuration < 1.0) {
+        finalEndTime = Math.min(finalStartTime + 1.0, maxAvailableDuration);
+        finalDuration = finalEndTime - finalStartTime;
+      }
+      
+      // Ensure finalDuration doesn't exceed available duration
+      finalDuration = Math.min(finalDuration, maxAvailableDuration - finalStartTime);
+      
+      if (finalDuration < 1.0) {
+        console.error("❌ Cannot extract 1 second from video");
+        if (!res.headersSent) {
+          return res.status(400).json({ error: "Cannot extract 1 second from the selected time range. Please adjust start/end times." });
+        }
+        return cleanup();
+      }
+
+      console.log("✅ Processing:", finalStartTime, "to", finalEndTime, "duration:", finalDuration, "FPS:", validFPS);
+
+      const paletteFilter = speedFilter 
+        ? `${speedFilter}fps=${validFPS},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`
+        : `fps=${validFPS},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`;
+
+      // Create ffmpeg instance for palette generation
+      const paletteFfmpeg = ffmpeg(inputPath);
+      
+      // Add trim options - ensure we don't exceed video duration
+      if (finalStartTime > 0 && finalStartTime < actualDuration) {
+        paletteFfmpeg.seekInput(finalStartTime);
+      }
+      // Only set duration if it's valid and less than remaining video
+      const remainingDuration = actualDuration - finalStartTime;
+      const safeDuration = Math.min(finalDuration, remainingDuration);
+      if (safeDuration >= 1.0 && safeDuration <= 600) {
+        paletteFfmpeg.duration(safeDuration);
+      } else {
+        console.error("❌ Invalid duration calculated:", safeDuration);
+        if (!res.headersSent) {
+          return res.status(400).json({ error: "Invalid video duration. Please try a different video." });
+        }
+        return cleanup();
+      }
+      
+      // Optimize for speed - palettegen outputs PNG automatically
+      console.log("🎨 Starting palette generation with filter:", paletteFilter);
+      paletteFfmpeg
+        .outputOptions([
+          "-vf", paletteFilter,
+          "-threads", "0"  // Auto-detect optimal thread count
+        ])
+        .on("start", (cmd) => {
+          console.log("▶️ FFmpeg command:", cmd);
+        })
+        .on("progress", (progress) => {
+          if (progress && progress.percent !== undefined) {
+            console.log("📊 Palette progress:", progress.percent + "%");
+          }
+        })
+        .on("end", () => {
+          console.log("✅ Palette generation completed");
+          // Step 2: Use palette for better color accuracy
+          // Use validated FPS
+          const conversionFilter = speedFilter
+            ? `[0:v]${speedFilter}fps=${validFPS},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`
+            : `[0:v]fps=${validFPS},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`;
+          
+          // Create ffmpeg instance for conversion
+          const convertFfmpeg = ffmpeg(inputPath);
+          
+          // Add trim options for conversion - use same values as palette
+          const remainingDuration = actualDuration - finalStartTime;
+          const safeDuration = Math.min(finalDuration, remainingDuration);
+          if (finalStartTime > 0 && finalStartTime < actualDuration) {
+            convertFfmpeg.seekInput(finalStartTime);
+          }
+          if (safeDuration >= 1.0 && safeDuration <= 600) {
+            convertFfmpeg.duration(safeDuration);
+          } else {
+            console.error("❌ Invalid duration for conversion:", safeDuration);
+            if (!res.headersSent) {
+              return res.status(400).json({ error: "Invalid video duration for conversion." });
+            }
+            return cleanup();
+          }
+          
+          // Optimize for speed
+          convertFfmpeg
+            .input(palettePath)
+            .complexFilter(conversionFilter)
+            .outputOptions([
+              "-loop", loopValue,
+              "-threads", "0"  // Auto-detect optimal thread count
+            ])
+            .toFormat("gif")
+            .on("error", (err) => {
+              console.error("❌ FFmpeg error:", err.message);
+              if (!res.headersSent) {
+                res.status(500).json({ error: "Video conversion failed: " + err.message });
+              }
+              cleanup();
+            })
+            .on("end", () => {
+              if (!res.headersSent) {
+                res.download(outputFile, () => cleanup());
+              } else {
+                cleanup();
+              }
+            })
+            .save(outputFile);
+        })
+        .on("error", (err) => {
+          console.error("❌ Palette generation error:", err.message);
+          console.error("❌ Error details:", err);
+          if (err.stderr) {
+            console.error("❌ FFmpeg stderr:", err.stderr);
+          }
+          if (!res.headersSent) {
+            res.status(500).json({ error: "Palette generation failed: " + err.message });
+          }
+          cleanup();
+        })
+        .save(palettePath);
+    });
   } catch (error) {
     console.error("❌ Server error:", error.message);
     if (!res.headersSent) {
