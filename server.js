@@ -2,9 +2,15 @@ import express from "express";
 import multer from "multer";
 import ffmpeg from "fluent-ffmpeg";
 import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 import cors from "cors";
 import dotenv from "dotenv";
 dotenv.config();
+
+// Get __dirname for ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
@@ -12,6 +18,13 @@ app.use(cors());
 // Text fields from multipart/form-data will be in req.body
 
 const API_KEY = process.env.ES_API_KEY;
+
+// Ensure uploads directory exists
+const uploadsDir = "uploads";
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+  console.log("📁 Created uploads directory");
+}
 
 // API Key protection
 app.use((req, res, next) => {
@@ -61,7 +74,7 @@ app.post("/convert", upload.single("video"), (req, res) => {
       return res.status(400).json({ error: "No video file uploaded. Please ensure the file field is named 'video'." });
     }
 
-    const inputPath = req.file.path;
+  const inputPath = req.file.path;
     
     // Check if input file exists
     if (!fs.existsSync(inputPath)) {
@@ -79,8 +92,11 @@ app.post("/convert", upload.single("video"), (req, res) => {
       return res.status(400).json({ error: "Uploaded file is empty. Please upload a valid video file." });
     }
     
-    const outputFile = `output_${Date.now()}.gif`;
-    const palettePath = `palette_${Date.now()}.png`;
+  // Use absolute paths for output files
+  const outputFile = path.join(__dirname, `output_${Date.now()}.gif`);
+    const palettePath = path.join(__dirname, `palette_${Date.now()}.png`);
+    
+    console.log("📁 Output paths:", { outputFile, palettePath });
 
     // Clean up temp files
     function cleanup() {
@@ -96,12 +112,11 @@ app.post("/convert", upload.single("video"), (req, res) => {
     }
 
     // Debug: Log received data
-    console.log("📥 Received request body:", req.body);
-    console.log("📁 File info:", req.file ? { name: req.file.originalname, size: req.file.size } : "No file");
+    console.log("📥 Received request body:", JSON.stringify(req.body, null, 2));
+    console.log("📁 File info:", req.file ? { name: req.file.originalname, size: req.file.size, path: req.file.path } : "No file");
     
     // Dynamic values from frontend (or defaults) - ensure we parse them correctly
     // Multer parses text fields as strings, so we need to convert them
-    // Lower default FPS for faster conversion
     let fps = req.body.fps ? parseInt(String(req.body.fps)) : 10;
     let quality = (req.body.quality && ['low', 'medium', 'high'].includes(String(req.body.quality))) 
       ? String(req.body.quality) 
@@ -110,6 +125,16 @@ app.post("/convert", upload.single("video"), (req, res) => {
     let speed = req.body.speed ? parseFloat(String(req.body.speed)) : 1.0;
     let startTime = req.body.startTime ? parseFloat(String(req.body.startTime)) : 0;
     let endTime = req.body.endTime ? parseFloat(String(req.body.endTime)) : 60;
+    
+    console.log("⚙️ Raw settings from request:", {
+      fps: req.body.fps,
+      quality: req.body.quality,
+      size: req.body.size,
+      speed: req.body.speed,
+      startTime: req.body.startTime,
+      endTime: req.body.endTime,
+      loop: req.body.loop
+    });
     
     console.log("⚙️ Parsed settings:", { fps, quality, size, speed, startTime, endTime });
     
@@ -139,22 +164,29 @@ app.post("/convert", upload.single("video"), (req, res) => {
       console.warn("⚠️ Invalid startTime, using default 0");
       startTime = 0;
     }
+    // Validate endTime - ensure it's greater than startTime
     if (isNaN(endTime) || endTime <= startTime) {
-      console.warn("⚠️ Invalid endTime, using default 60");
-      endTime = 60;
+      console.warn("⚠️ Invalid endTime:", endTime, "startTime:", startTime, "using startTime + 1");
+      endTime = startTime + 1.0;
     }
     
-    // Parse loop parameter - handle string '1'/'0', number 1/0, or boolean
-    let loop = true; // Default to true
-    if (req.body.loop !== undefined && req.body.loop !== null) {
-      const loopValue = req.body.loop;
-      if (loopValue === '0' || loopValue === 0 || loopValue === false || loopValue === 'false') {
-        loop = false;
-      } else if (loopValue === '1' || loopValue === 1 || loopValue === true || loopValue === 'true') {
-        loop = true;
-      }
+    // Ensure minimum 1 second duration
+    if (endTime - startTime < 1.0) {
+      console.warn("⚠️ Duration too short, adjusting endTime");
+      endTime = startTime + 1.0;
     }
-
+  
+  // Parse loop parameter - handle string '1'/'0', number 1/0, or boolean
+  let loop = true; // Default to true
+  if (req.body.loop !== undefined && req.body.loop !== null) {
+    const loopValue = req.body.loop;
+    if (loopValue === '0' || loopValue === 0 || loopValue === false || loopValue === 'false') {
+      loop = false;
+    } else if (loopValue === '1' || loopValue === 1 || loopValue === true || loopValue === 'true') {
+      loop = true;
+    }
+  }
+  
     // Dynamic scale - size can be any number (100-800px)
     // Size is already validated above, so we can safely use sizeNum from validation
     const clampedSize = Math.max(100, Math.min(800, sizeNum)); // Clamp between 100-800px
@@ -170,17 +202,17 @@ app.post("/convert", upload.single("video"), (req, res) => {
       speedFilter = `setpts=${setptsValue}*PTS,`;
     }
 
-    // Dithering & color optimization based on quality
-    let dither = "bayer";
-    if (quality === "high") dither = "floyd_steinberg";
+  // Dithering & color optimization based on quality
+  let dither = "bayer";
+  if (quality === "high") dither = "floyd_steinberg";
     if (quality === "low") dither = "bayer"; // Keep bayer even for low quality
 
     // Use faster scaling algorithms for speed
     // fast_bilinear is fastest, bilinear is faster, lanczos is best but slowest
     const scaleFlags = quality === "low" ? "flags=fast_bilinear" : quality === "medium" ? "flags=bilinear" : "flags=lanczos";
 
-    // Set loop value: 0 = infinite loop, -1 = no loop (plays once)
-    const loopValue = loop ? "0" : "-1";
+  // Set loop value: 0 = infinite loop, -1 = no loop (plays once)
+  const loopValue = loop ? "0" : "-1";
 
     // Step 1: Generate color palette (optimized for speed)
     // Use stats_mode=single for all quality levels - much faster than diff
@@ -232,23 +264,87 @@ app.post("/convert", upload.single("video"), (req, res) => {
 
       // Use actual video duration to limit requested duration
       const maxAvailableDuration = Math.min(actualDuration, 60);
-      const finalStartTime = Math.max(0, Math.min(startTime, maxAvailableDuration - 1.0));
+      
+      // Clamp startTime to valid range (0 to maxAvailableDuration - 1)
+      let finalStartTime = Math.max(0, Math.min(startTime, maxAvailableDuration - 1.0));
+      
+      // Clamp endTime - must be greater than startTime and within video duration
       let finalEndTime = Math.min(endTime, maxAvailableDuration);
       
-      // Ensure minimum 1 second duration
+      // Ensure endTime is always greater than startTime
+      if (finalEndTime <= finalStartTime) {
+        finalEndTime = Math.min(finalStartTime + 1.0, maxAvailableDuration);
+      }
+      
+      // Validate that all values are valid numbers
+      if (isNaN(finalStartTime) || isNaN(finalEndTime) || !isFinite(finalStartTime) || !isFinite(finalEndTime)) {
+        console.error("❌ Invalid numeric values for start/end time");
+        console.error("📊 Values:", {
+          actualDuration,
+          maxAvailableDuration,
+          requested: { startTime, endTime },
+          final: { finalStartTime, finalEndTime }
+        });
+        if (!res.headersSent) {
+          return res.status(400).json({ error: `Invalid time values. Please ensure start and end times are valid numbers.` });
+        }
+        return cleanup();
+      }
+      
+      // Calculate final duration
       let finalDuration = finalEndTime - finalStartTime;
+      
+      // Validate duration is a valid number
+      if (isNaN(finalDuration) || !isFinite(finalDuration)) {
+        console.error("❌ Invalid duration calculation");
+        console.error("📊 Values:", {
+          actualDuration,
+          maxAvailableDuration,
+          requested: { startTime, endTime },
+          final: { finalStartTime, finalEndTime, finalDuration }
+        });
+        if (!res.headersSent) {
+          return res.status(400).json({ error: `Invalid duration calculation. Please check start and end times.` });
+        }
+        return cleanup();
+      }
+      
+      // Ensure minimum 1 second duration
       if (finalDuration < 1.0) {
+        // Adjust endTime to ensure 1 second minimum
         finalEndTime = Math.min(finalStartTime + 1.0, maxAvailableDuration);
         finalDuration = finalEndTime - finalStartTime;
       }
       
-      // Ensure finalDuration doesn't exceed available duration
+      // Final validation
+      if (finalDuration < 1.0 || finalEndTime <= finalStartTime || finalStartTime >= maxAvailableDuration || isNaN(finalDuration) || !isFinite(finalDuration)) {
+        console.error("❌ Invalid time range after validation");
+        console.error("📊 Values:", {
+          actualDuration,
+          maxAvailableDuration,
+          requested: { startTime, endTime },
+          final: { finalStartTime, finalEndTime, finalDuration }
+        });
+        if (!res.headersSent) {
+          return res.status(400).json({ error: `Invalid time range. Video duration: ${actualDuration.toFixed(2)}s. Please adjust start/end times.` });
+        }
+        return cleanup();
+      }
+      
+      // Ensure duration doesn't exceed available
       finalDuration = Math.min(finalDuration, maxAvailableDuration - finalStartTime);
       
-      if (finalDuration < 1.0) {
-        console.error("❌ Cannot extract 1 second from video");
+      // Final check - ensure duration is still valid after clamping
+      if (isNaN(finalDuration) || !isFinite(finalDuration) || finalDuration < 1.0) {
+        console.error("❌ Invalid duration after final calculation");
+        console.error("📊 Values:", {
+          actualDuration,
+          maxAvailableDuration,
+          requested: { startTime, endTime },
+          final: { finalStartTime, finalEndTime, finalDuration }
+        });
         if (!res.headersSent) {
-          return res.status(400).json({ error: "Cannot extract 1 second from the selected time range. Please adjust start/end times." });
+          return res.status(400).json({ error: `Invalid duration: ${finalDuration}. Please try again with different time settings.` });
         }
         return cleanup();
       }
@@ -262,46 +358,22 @@ app.post("/convert", upload.single("video"), (req, res) => {
       // Create ffmpeg instance for palette generation
       const paletteFfmpeg = ffmpeg(inputPath);
       
-      // Add trim options - ensure we don't exceed video duration
-      if (finalStartTime > 0 && finalStartTime < actualDuration) {
-        paletteFfmpeg.seekInput(finalStartTime);
+      // Add trim options for palette generation
+      // Ensure values are valid numbers before passing to FFmpeg
+      const safeStartTime = isNaN(finalStartTime) || !isFinite(finalStartTime) ? 0 : Math.max(0, finalStartTime);
+      const safeDuration = isNaN(finalDuration) || !isFinite(finalDuration) || finalDuration < 1.0 ? 1.0 : finalDuration;
+      
+      console.log("🔧 FFmpeg parameters:", { safeStartTime, safeDuration, original: { finalStartTime, finalDuration } });
+      
+      if (safeStartTime > 0) {
+        paletteFfmpeg.seekInput(safeStartTime);
       }
-      // Only set duration if it's valid and less than remaining video
-      const remainingDuration = actualDuration - finalStartTime;
-      const safeDuration = Math.min(finalDuration, remainingDuration);
-      
-      console.log("🔢 Duration calculations:", {
-        actualDuration,
-        finalStartTime,
-        finalEndTime,
-        finalDuration,
-        remainingDuration,
-        safeDuration
-      });
-      
-      if (safeDuration < 1.0) {
-        console.error("❌ Safe duration too short:", safeDuration);
-        if (!res.headersSent) {
-          return res.status(400).json({ error: `Cannot extract valid duration from video. Video duration: ${actualDuration.toFixed(2)}s, Requested: ${startTime.toFixed(2)}s to ${endTime.toFixed(2)}s. Please adjust the time range.` });
-        }
-        return cleanup();
-      }
-      
-      if (safeDuration > 600) {
-        console.error("❌ Safe duration too long:", safeDuration);
-        if (!res.headersSent) {
-          return res.status(400).json({ error: "Requested duration exceeds maximum allowed (600 seconds)." });
-        }
-        return cleanup();
-      }
-      
-      // Set duration for palette generation
       paletteFfmpeg.duration(safeDuration);
       
       // Optimize for speed - palettegen outputs PNG automatically
       console.log("🎨 Starting palette generation with filter:", paletteFilter);
       paletteFfmpeg
-        .outputOptions([
+    .outputOptions([
           "-vf", paletteFilter,
           "-threads", "0"  // Auto-detect optimal thread count
         ])
@@ -313,9 +385,9 @@ app.post("/convert", upload.single("video"), (req, res) => {
             console.log("📊 Palette progress:", progress.percent + "%");
           }
         })
-        .on("end", () => {
+    .on("end", () => {
           console.log("✅ Palette generation completed");
-          // Step 2: Use palette for better color accuracy
+      // Step 2: Use palette for better color accuracy
           // Use validated FPS
           const conversionFilter = speedFilter
             ? `[0:v]${speedFilter}fps=${validFPS},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`
@@ -324,47 +396,32 @@ app.post("/convert", upload.single("video"), (req, res) => {
           // Create ffmpeg instance for conversion
           const convertFfmpeg = ffmpeg(inputPath);
           
-          // Add trim options for conversion - use same values as palette
-          const remainingDurationForConversion = actualDuration - finalStartTime;
-          const safeDurationForConversion = Math.min(finalDuration, remainingDurationForConversion);
+          // Add trim options for conversion - use same safe values as palette
+          const safeStartTime = isNaN(finalStartTime) || !isFinite(finalStartTime) ? 0 : Math.max(0, finalStartTime);
+          const safeDuration = isNaN(finalDuration) || !isFinite(finalDuration) || finalDuration < 1.0 ? 1.0 : finalDuration;
           
-          console.log("🔢 Conversion duration:", {
-            safeDurationForConversion,
-            remainingDurationForConversion,
-            finalDuration
-          });
-          
-          if (finalStartTime > 0 && finalStartTime < actualDuration) {
-            convertFfmpeg.seekInput(finalStartTime);
+          if (safeStartTime > 0) {
+            convertFfmpeg.seekInput(safeStartTime);
           }
-          
-          if (safeDurationForConversion < 1.0) {
-            console.error("❌ Invalid duration for conversion:", safeDurationForConversion);
-            if (!res.headersSent) {
-              return res.status(400).json({ error: `Invalid duration for conversion (${safeDurationForConversion.toFixed(2)}s). Please try a different video or adjust time range.` });
-            }
-            return cleanup();
-          }
-          
-          convertFfmpeg.duration(safeDurationForConversion);
+          convertFfmpeg.duration(safeDuration);
           
           // Optimize for speed
           convertFfmpeg
-            .input(palettePath)
+        .input(palettePath)
             .complexFilter(conversionFilter)
             .outputOptions([
               "-loop", loopValue,
               "-threads", "0"  // Auto-detect optimal thread count
             ])
-            .toFormat("gif")
-            .on("error", (err) => {
-              console.error("❌ FFmpeg error:", err.message);
+        .toFormat("gif")
+        .on("error", (err) => {
+          console.error("❌ FFmpeg error:", err.message);
               if (!res.headersSent) {
                 res.status(500).json({ error: "Video conversion failed: " + err.message });
               }
-              cleanup();
-            })
-            .on("end", () => {
+          cleanup();
+        })
+        .on("end", () => {
               if (!res.headersSent) {
                 // Check if output file exists
                 if (!fs.existsSync(outputFile)) {
@@ -373,11 +430,22 @@ app.post("/convert", upload.single("video"), (req, res) => {
                 }
                 
                 // Send GIF file with proper headers
-                res.setHeader('Content-Type', 'image/gif');
-                res.setHeader('Content-Disposition', `attachment; filename="converted_${Date.now()}.gif"`);
+                console.log("📤 Sending GIF file:", outputFile);
+                console.log("📊 File size:", fs.statSync(outputFile).size, "bytes");
+                
+                // Set headers before streaming
+                if (!res.headersSent) {
+                  res.setHeader('Content-Type', 'image/gif');
+                  res.setHeader('Content-Disposition', `attachment; filename="converted_${Date.now()}.gif"`);
+                  res.setHeader('Content-Length', fs.statSync(outputFile).size);
+                }
+                
                 const fileStream = fs.createReadStream(outputFile);
                 fileStream.pipe(res);
-                fileStream.on('end', () => cleanup());
+                fileStream.on('end', () => {
+                  console.log("✅ GIF file sent successfully");
+                  cleanup();
+                });
                 fileStream.on('error', (err) => {
                   console.error("❌ Error streaming file:", err);
                   if (!res.headersSent) {
@@ -388,11 +456,11 @@ app.post("/convert", upload.single("video"), (req, res) => {
               } else {
                 cleanup();
               }
-            })
-            .save(outputFile);
         })
-        .on("error", (err) => {
-          console.error("❌ Palette generation error:", err.message);
+        .save(outputFile);
+    })
+    .on("error", (err) => {
+      console.error("❌ Palette generation error:", err.message);
           console.error("❌ Error details:", err);
           if (err.stderr) {
             console.error("❌ FFmpeg stderr:", err.stderr);
@@ -400,14 +468,26 @@ app.post("/convert", upload.single("video"), (req, res) => {
           if (!res.headersSent) {
             res.status(500).json({ error: "Palette generation failed: " + err.message });
           }
-          cleanup();
-        })
-        .save(palettePath);
+      cleanup();
+    })
+    .save(palettePath);
     });
   } catch (error) {
     console.error("❌ Server error:", error.message);
+    console.error("❌ Error stack:", error.stack);
+    console.error("❌ Error details:", {
+      name: error.name,
+      message: error.message,
+      code: error.code,
+      errno: error.errno,
+      syscall: error.syscall
+    });
     if (!res.headersSent) {
-      res.status(500).json({ error: "Server error: " + error.message });
+      // Send detailed error message for debugging
+      const errorMessage = process.env.NODE_ENV === 'development' 
+        ? `Server error: ${error.message} (${error.name})`
+        : `Server error: ${error.message}`;
+      res.status(500).json({ error: errorMessage });
     }
   }
 });
