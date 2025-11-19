@@ -34,7 +34,9 @@ app.post("/convert", upload.single("video"), (req, res) => {
 
   const inputPath = req.file.path;
   const outputFile = `output_${Date.now()}.gif`;
-
+  
+  // Debug: Log received size value
+  console.log("📦 Received size from request:", req.body.size, "type:", typeof req.body.size);
 
   // Dynamic values from frontend (or defaults) - ensure we parse them correctly
   // Multer parses text fields as strings, so we need to convert them
@@ -54,9 +56,10 @@ app.post("/convert", upload.single("video"), (req, res) => {
   }
   
   // Validate and parse size
-  const sizeNum = parseInt(size) || 480;
+  let sizeNum = parseInt(size) || 480;
   if (isNaN(sizeNum) || sizeNum < 100 || sizeNum > 800) {
     console.warn("⚠️ Invalid size:", size, "using default 480");
+    sizeNum = 480;
     size = "480";
   } else {
     size = String(sizeNum);
@@ -124,6 +127,10 @@ app.post("/convert", upload.single("video"), (req, res) => {
   // Use full 256 colors for all quality levels for better color accuracy
   const paletteSize = "256"; // Full palette for all quality levels
   const statsMode = quality === "low" ? "single" : "diff"; // Use diff for medium/high quality
+  
+  // Debug: Log scale value to verify size is being used
+  console.log("📏 Scale value:", scale, "from size:", sizeNum, "clampedSize:", clampedSize);
+  
   const paletteFilter = speedFilter 
     ? `${speedFilter}fps=${fps},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`
     : `fps=${fps},scale=${scale}:${scaleFlags},palettegen=stats_mode=${statsMode}:max_colors=${paletteSize}`;
@@ -150,6 +157,9 @@ app.post("/convert", upload.single("video"), (req, res) => {
       const conversionFilter = speedFilter
         ? `[0:v]${speedFilter}fps=${fps},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`
         : `[0:v]fps=${fps},scale=${scale}:${scaleFlags}[x];[x][1:v]paletteuse=dither=${dither}`;
+      
+      console.log("🎨 Conversion filter with scale:", conversionFilter);
+      console.log("📐 Final scale value:", scale, "clampedSize:", clampedSize);
       
       // Create ffmpeg instance for conversion
       const convertFfmpeg = ffmpeg(inputPath);
