@@ -49,6 +49,7 @@ if (!fs.existsSync("uploads")) {
 app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
     let inputPath = null;
     let outputPath = null;
+    let palettePath = null;
 
     try {
         if (!req.file) {
@@ -84,14 +85,29 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
             return res.status(400).json({ error: "Video duration cannot exceed 60 seconds" });
         }
 
-        // QUALITY PRESETS
-        let qscale = 20; // medium (default)
-        if (quality === "low") qscale = 30;
-        else if (quality === "high") qscale = 10;
+        // QUALITY PRESETS for GIF
+        // For GIFs, we use palette-based encoding for better quality control
+        let paletteColors = 256; // Default for medium
+        let dither = "bayer"; // Dithering algorithm
+        let qscale = 20; // Fallback qscale
+        
+        if (quality === "low") {
+            paletteColors = 128; // Fewer colors = smaller file, lower quality
+            qscale = 31; // Lower quality
+        } else if (quality === "high") {
+            paletteColors = 256; // Full color palette
+            qscale = 10; // Higher quality
+        } else {
+            // medium (default)
+            paletteColors = 256;
+            qscale = 20;
+        }
 
         console.log("Conversion started:", {
             fps: fpsNum,
             quality: quality,
+            paletteColors: paletteColors,
+            qscale: qscale,
             size: sizeNum,
             speed: speedNum,
             start: startNum,
@@ -100,17 +116,55 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
             loop: loopNum
         });
 
-        // FFmpeg processing
+        // Create palette file path
+        palettePath = `palette_${Date.now()}.png`;
+
+        // Step 1: Generate palette from video
+        try {
+            await new Promise((resolve, reject) => {
+                ffmpeg(inputPath)
+                    .setStartTime(startNum)
+                    .setDuration(duration)
+                    .videoFilters([
+                        `fps=${fpsNum}`,
+                        `scale=${sizeNum}:-1:flags=lanczos`,
+                        `setpts=${1 / speedNum}*PTS`,
+                        `palettegen=max_colors=${paletteColors}:reserve_transparent=0`
+                    ])
+                    .outputOptions(["-y"])
+                    .output(palettePath)
+                    .on("end", () => {
+                        console.log("Palette generated successfully");
+                        resolve();
+                    })
+                    .on("error", (err) => {
+                        console.error("Palette generation error:", err);
+                        reject(err);
+                    })
+                    .run();
+            });
+        } catch (paletteError) {
+            console.error("Failed to generate palette:", paletteError);
+            if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+            if (fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
+            return res.status(500).json({ 
+                error: "Failed to generate color palette", 
+                details: paletteError.message 
+            });
+        }
+
+        // Step 2: Create GIF using palette
         ffmpeg(inputPath)
             .setStartTime(startNum)
             .setDuration(duration)
             .videoFilters([
                 `fps=${fpsNum}`,
-                `scale=${sizeNum}:-1`,
-                `setpts=${1 / speedNum}*PTS`
+                `scale=${sizeNum}:-1:flags=lanczos`,
+                `setpts=${1 / speedNum}*PTS`,
+                `paletteuse=dither=${dither}`
             ])
+            .input(palettePath)
             .outputOptions([`-loop ${loopNum}`]) // 0 = infinite, 1 = once, 2 = twice, etc.
-            .outputOptions([`-qscale ${qscale}`])
             .outputOptions(["-y"]) // Overwrite output file
             .output(outputPath)
             .on("start", (commandLine) => {
@@ -140,10 +194,12 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
                     // Cleanup
                     if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
                     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                    if (fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
                 } catch (err) {
                     console.error("Error sending response:", err);
                     if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
                     if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                    if (fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
                     return res.status(500).json({ error: "Failed to read output file", details: err.message });
                 }
             })
@@ -152,6 +208,7 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
                 // Cleanup on error
                 if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
                 if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+                if (fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
                 return res.status(500).json({ 
                     error: "Conversion failed", 
                     details: err.message 
@@ -164,6 +221,7 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
         // Cleanup on error
         if (inputPath && fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
         if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        if (palettePath && fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
         return res.status(500).json({ 
             error: "Server error", 
             details: err.message 
