@@ -86,16 +86,23 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
         }
 
         // QUALITY PRESETS for GIF
-        let paletteColors = 256; // Default for medium
+        let paletteColors = 128; // Default for medium
         let dither = "bayer"; // Dithering algorithm
+        let statsMode = "full"; // Palette generation mode
         
         if (quality === "low") {
-            paletteColors = 128; // Fewer colors = smaller file, lower quality
+            paletteColors = 64; // 64 colors = smaller file, lower quality
+            dither = "none"; // No dithering for faster processing
+            statsMode = "diff"; // Faster but lower quality
         } else if (quality === "high") {
-            paletteColors = 256; // Full color palette
+            paletteColors = 256; // 256 colors = full color palette, best quality
+            dither = "bayer:bayer_scale=5"; // Better dithering for high quality
+            statsMode = "full"; // Best quality palette generation
         } else {
             // medium (default)
-            paletteColors = 256;
+            paletteColors = 128; // 128 colors = balanced quality
+            dither = "bayer"; // Standard dithering
+            statsMode = "full";
         }
 
         console.log("Conversion started:", {
@@ -123,7 +130,7 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
                         `fps=${fpsNum}`,
                         `scale=${sizeNum}:-1:flags=lanczos`,
                         `setpts=${1 / speedNum}*PTS`,
-                        `palettegen=max_colors=${paletteColors}:reserve_transparent=0`
+                        `palettegen=max_colors=${paletteColors}:reserve_transparent=0:stats_mode=${statsMode}`
                     ])
                     .outputOptions(["-y"])
                     .output(palettePath)
