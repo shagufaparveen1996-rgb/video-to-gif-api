@@ -2,8 +2,10 @@ import express from "express";
 import multer from "multer";
 import ffmpeg from "fluent-ffmpeg";
 import fs from "fs";
+import path from "path";
 import cors from "cors";
 import dotenv from "dotenv";
+
 dotenv.config();
 
 const app = express();
@@ -12,94 +14,97 @@ app.use(express.json());
 
 const API_KEY = process.env.ES_API_KEY;
 
-// API Key protection
-app.use((req, res, next) => {
-  const key = req.headers["x-api-key"];
-  if (!key || key !== API_KEY) {
-    return res.status(403).json({ error: "Unauthorized" });
-  }
-  next();
-});
+// -------------------------
+//  API KEY MIDDLEWARE
+// -------------------------
+function checkAPIKey(req, res, next) {
+    const key = req.headers["x-api-key"];
 
+    if (!key) {
+        return res.status(401).json({ error: "API key missing" });
+    }
+
+    if (key !== API_KEY) {
+        return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    next();
+}
+
+// -------------------------
+// Multer storage (temp uploads)
+// -------------------------
 const upload = multer({ dest: "uploads/" });
 
-// API endpoint: Convert video → high-quality, dynamic GIF
-app.post("/convert", upload.single("video"), (req, res) => {
-  if (!req.file) return res.status(400).send("No video file uploaded.");
+// -------------------------
+// Convert Route
+// -------------------------
+app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: "No video uploaded" });
+        }
 
-  const inputPath = req.file.path;
-  const outputFile = `output_${Date.now()}.gif`;
+        const {
+            fps = 15,
+            quality = "medium",
+            size = 480,
+            speed = 1.0,
+            startTime = 0,
+            endTime = 60,
+            loop = 1
+        } = req.body;
 
-  // Dynamic values from frontend (or defaults)
-  const fps = req.body.fps ? parseInt(req.body.fps) : 15;
-  const quality = req.body.quality || "medium"; // low | medium | high
-  const size = req.body.size || "480"; // 480 | 720 | 1080
-  const loop = req.body.loop !== undefined ? (req.body.loop === '1' || req.body.loop === 1 || req.body.loop === true) : true; // Default to true (loop enabled)
+        const inputPath = req.file.path;
+        const outputPath = `output_${Date.now()}.gif`;
 
-  // Dynamic scale
-  let scale;
-  if (size === "1080") scale = "1080:-1";
-  else if (size === "720") scale = "720:-1";
-  else scale = "480:-1";
+        // QUALITY PRESETS
+        let qscale = 20; // medium
+        if (quality === "low") qscale = 30;
+        if (quality === "high") qscale = 10;
 
-  // Dithering & color optimization based on quality
-  let dither = "bayer";
-  if (quality === "high") dither = "floyd_steinberg";
-  if (quality === "low") dither = "none";
+        // FFmpeg processing
+        ffmpeg(inputPath)
+            .setStartTime(startTime)
+            .setDuration(endTime - startTime)
+            .videoFilters([
+                `fps=${fps}`,
+                `scale=${size}:-1`,
+                `setpts=${1 / speed}*PTS`
+            ])
+            .outputOptions([`-loop ${loop}`])
+            .outputOptions([`-qscale ${qscale}`])
+            .output(outputPath)
+            .on("end", () => {
+                const gifBuffer = fs.readFileSync(outputPath);
 
-  // Generate temporary palette
-  const palettePath = `palette_${Date.now()}.png`;
+                // Return GIF as base64
+                res.setHeader("Content-Type", "image/gif");
+                res.send(gifBuffer);
 
-  // Set loop value: 0 = infinite loop, -1 = no loop (plays once)
-  const loopValue = loop ? "0" : "-1";
+                // Cleanup
+                fs.unlinkSync(inputPath);
+                fs.unlinkSync(outputPath);
+            })
+            .on("error", (err) => {
+                console.error(err);
+                fs.unlinkSync(inputPath);
+                return res.status(500).json({ error: "Conversion failed", details: err.message });
+            })
+            .run();
 
-  console.log("🎬 Starting conversion with settings:", { fps, scale, dither, loop: loopValue });
-
-  // Step 1: Generate color palette
-  ffmpeg(inputPath)
-    .outputOptions([
-      "-vf",
-      `fps=${fps},scale=${scale}:flags=lanczos,palettegen=stats_mode=diff`
-    ])
-    .on("end", () => {
-      // Step 2: Use palette for better color accuracy
-      ffmpeg(inputPath)
-        .input(palettePath)
-        .complexFilter(
-          `[0:v]fps=${fps},scale=${scale}:flags=lanczos[x];[x][1:v]paletteuse=dither=${dither}`
-        )
-        .outputOptions(["-loop", loopValue])
-        .toFormat("gif")
-        .on("start", (cmd) => console.log("⚙️ FFmpeg command:", cmd))
-        .on("error", (err) => {
-          console.error("❌ FFmpeg error:", err.message);
-          res.status(500).send("Video conversion failed");
-          cleanup();
-        })
-        .on("end", () => {
-          console.log("✅ Conversion done:", outputFile);
-          res.download(outputFile, () => cleanup());
-        })
-        .save(outputFile);
-    })
-    .on("error", (err) => {
-      console.error("❌ Palette generation error:", err.message);
-      res.status(500).send("Palette generation failed");
-      cleanup();
-    })
-    .save(palettePath);
-
-  // Clean up temp files
-  function cleanup() {
-    [inputPath, outputFile, palettePath].forEach((file) => {
-      if (fs.existsSync(file)) fs.unlinkSync(file);
-    });
-  }
+    } catch (err) {
+        return res.status(500).json({ error: "Server error", details: err.message });
+    }
 });
 
-// Test route
+// -------------------------
+// TEST ROUTE
+// -------------------------
 app.get("/", (req, res) => {
-  res.send("✅ Video to GIF API running successfully — use /convert endpoint");
+    res.json({ status: "Video to GIF API running" });
 });
 
-app.listen(10000, () => console.log("🚀 Server running on port 10000"));
+// -------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("API running on", PORT));
