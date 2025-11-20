@@ -86,28 +86,22 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
         }
 
         // QUALITY PRESETS for GIF
-        // For GIFs, we use palette-based encoding for better quality control
         let paletteColors = 256; // Default for medium
         let dither = "bayer"; // Dithering algorithm
-        let qscale = 20; // Fallback qscale
         
         if (quality === "low") {
             paletteColors = 128; // Fewer colors = smaller file, lower quality
-            qscale = 31; // Lower quality
         } else if (quality === "high") {
             paletteColors = 256; // Full color palette
-            qscale = 10; // Higher quality
         } else {
             // medium (default)
             paletteColors = 256;
-            qscale = 20;
         }
 
         console.log("Conversion started:", {
             fps: fpsNum,
             quality: quality,
             paletteColors: paletteColors,
-            qscale: qscale,
             size: sizeNum,
             speed: speedNum,
             start: startNum,
@@ -153,68 +147,56 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
             });
         }
 
-        // Step 2: Create GIF using palette
-        ffmpeg(inputPath)
-            .setStartTime(startNum)
-            .setDuration(duration)
-            .videoFilters([
-                `fps=${fpsNum}`,
-                `scale=${sizeNum}:-1:flags=lanczos`,
-                `setpts=${1 / speedNum}*PTS`,
-                `paletteuse=dither=${dither}`
-            ])
-            .input(palettePath)
-            .outputOptions([`-loop ${loopNum}`]) // 0 = infinite, 1 = once, 2 = twice, etc.
-            .outputOptions(["-y"]) // Overwrite output file
-            .output(outputPath)
-            .on("start", (commandLine) => {
-                console.log("FFmpeg command:", commandLine);
-            })
-            .on("progress", (progress) => {
-                if (progress.percent) {
-                    console.log("Processing: " + Math.floor(progress.percent) + "% done");
-                }
-            })
-            .on("end", () => {
-                try {
-                    if (!fs.existsSync(outputPath)) {
-                        throw new Error("Output file was not created");
+        // Step 2: Create GIF using palette with filter_complex
+        const filterComplex = `[0:v]fps=${fpsNum},scale=${sizeNum}:-1:flags=lanczos,setpts=${1 / speedNum}*PTS[v];[v][1:v]paletteuse=dither=${dither}`;
+        
+        await new Promise((resolve, reject) => {
+            ffmpeg()
+                .input(inputPath)
+                .inputOptions([`-ss ${startNum}`, `-t ${duration}`])
+                .input(palettePath)
+                .complexFilter(filterComplex)
+                .outputOptions([`-loop ${loopNum}`]) // 0 = infinite, 1 = once, 2 = twice, etc.
+                .outputOptions(["-y"]) // Overwrite output file
+                .output(outputPath)
+                .on("start", (commandLine) => {
+                    console.log("FFmpeg command:", commandLine);
+                })
+                .on("progress", (progress) => {
+                    if (progress.percent) {
+                        console.log("Processing: " + Math.floor(progress.percent) + "% done");
                     }
+                })
+                .on("end", () => {
+                    console.log("GIF conversion completed");
+                    resolve();
+                })
+                .on("error", (err) => {
+                    console.error("FFmpeg error:", err);
+                    reject(err);
+                })
+                .run();
+        });
 
-                    const gifBuffer = fs.readFileSync(outputPath);
-                    const fileSize = gifBuffer.length;
+        // Read and send the GIF
+        if (!fs.existsSync(outputPath)) {
+            throw new Error("Output file was not created");
+        }
 
-                    console.log("Conversion successful. File size:", fileSize, "bytes");
+        const gifBuffer = fs.readFileSync(outputPath);
+        const fileSize = gifBuffer.length;
 
-                    // Return GIF as binary
-                    res.setHeader("Content-Type", "image/gif");
-                    res.setHeader("Content-Length", fileSize);
-                    res.send(gifBuffer);
+        console.log("Conversion successful. File size:", fileSize, "bytes");
 
-                    // Cleanup
-                    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-                    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-                    if (fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
-                } catch (err) {
-                    console.error("Error sending response:", err);
-                    if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-                    if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-                    if (fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
-                    return res.status(500).json({ error: "Failed to read output file", details: err.message });
-                }
-            })
-            .on("error", (err) => {
-                console.error("FFmpeg error:", err);
-                // Cleanup on error
-                if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
-                if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-                if (fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
-                return res.status(500).json({ 
-                    error: "Conversion failed", 
-                    details: err.message 
-                });
-            })
-            .run();
+        // Return GIF as binary
+        res.setHeader("Content-Type", "image/gif");
+        res.setHeader("Content-Length", fileSize);
+        res.send(gifBuffer);
+
+        // Cleanup
+        if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+        if (fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
 
     } catch (err) {
         console.error("Server error:", err);
@@ -223,7 +205,7 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
         if (outputPath && fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
         if (palettePath && fs.existsSync(palettePath)) fs.unlinkSync(palettePath);
         return res.status(500).json({ 
-            error: "Server error", 
+            error: "Conversion failed", 
             details: err.message 
         });
     }
