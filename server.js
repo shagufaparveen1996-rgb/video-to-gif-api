@@ -85,24 +85,28 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
             return res.status(400).json({ error: "Video duration cannot exceed 60 seconds" });
         }
 
-        // QUALITY PRESETS for GIF
+        // QUALITY PRESETS for GIF - Optimized for speed
         let paletteColors = 128; // Default for medium
         let dither = "bayer"; // Dithering algorithm
-        let statsMode = "full"; // Palette generation mode
+        let statsMode = "diff"; // Faster palette generation (changed from "full")
+        let scaleFlags = "fast_bilinear"; // Faster scaling (changed from "lanczos")
         
         if (quality === "low") {
             paletteColors = 64; // 64 colors = smaller file, lower quality
             dither = "none"; // No dithering for faster processing
-            statsMode = "diff"; // Faster but lower quality
+            statsMode = "diff"; // Fastest palette generation
+            scaleFlags = "fast_bilinear"; // Fastest scaling
         } else if (quality === "high") {
             paletteColors = 256; // 256 colors = full color palette, best quality
             dither = "bayer:bayer_scale=5"; // Better dithering for high quality
             statsMode = "full"; // Best quality palette generation
+            scaleFlags = "lanczos"; // Best quality scaling
         } else {
-            // medium (default)
+            // medium (default) - Balanced speed and quality
             paletteColors = 128; // 128 colors = balanced quality
             dither = "bayer"; // Standard dithering
-            statsMode = "full";
+            statsMode = "diff"; // Faster palette generation
+            scaleFlags = "bilinear"; // Balanced scaling speed
         }
 
         console.log("Conversion started:", {
@@ -120,19 +124,28 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
         // Create palette file path
         palettePath = `palette_${Date.now()}.png`;
 
-        // Step 1: Generate palette from video
+        // Step 1: Generate palette from video - ULTRA FAST mode
         try {
             await new Promise((resolve, reject) => {
+                // For faster processing, sample fewer frames for palette
+                const sampleRate = quality === "low" ? 3 : quality === "medium" ? 2 : 1; // Sample every Nth frame
+                const sampledFps = Math.max(2, fpsNum / sampleRate); // Minimum 2 fps for palette
+                
                 ffmpeg(inputPath)
-                    .setStartTime(startNum)
-                    .setDuration(duration)
+                    .inputOptions([`-ss ${startNum}`]) // Seek before input (faster for MP4)
+                    .inputOptions([`-t ${Math.min(duration, 10)}`]) // Limit to 10s max for palette (faster)
+                    .inputOptions(["-threads", "0"]) // Use all available CPU threads
+                    .inputOptions(["-vsync", "0"]) // Disable frame sync for speed
+                    .inputOptions(["-an"]) // Skip audio (not needed for palette)
+                    .inputOptions(["-sn"]) // Skip subtitles
                     .videoFilters([
-                        `fps=${fpsNum}`,
-                        `scale=${sizeNum}:-1:flags=lanczos`,
+                        `fps=${sampledFps}`, // Sample fewer frames for palette
+                        `scale=${sizeNum}:-1:flags=${scaleFlags}`, // Faster scaling
                         `setpts=${1 / speedNum}*PTS`,
-                        `palettegen=max_colors=${paletteColors}:reserve_transparent=0:stats_mode=${statsMode}`
+                        `palettegen=max_colors=${paletteColors}:reserve_transparent=0:stats_mode=${statsMode}` // Faster stats mode
                     ])
                     .outputOptions(["-y"])
+                    .outputOptions(["-threads", "0"]) // Use all threads for output
                     .output(palettePath)
                     .on("end", () => {
                         console.log("Palette generated successfully");
@@ -154,17 +167,24 @@ app.post("/convert", checkAPIKey, upload.single("video"), async (req, res) => {
             });
         }
 
-        // Step 2: Create GIF using palette with filter_complex
-        const filterComplex = `[0:v]fps=${fpsNum},scale=${sizeNum}:-1:flags=lanczos,setpts=${1 / speedNum}*PTS[v];[v][1:v]paletteuse=dither=${dither}`;
+        // Step 2: Create GIF using palette with filter_complex - ULTRA FAST mode
+        const filterComplex = `[0:v]fps=${fpsNum},scale=${sizeNum}:-1:flags=${scaleFlags},setpts=${1 / speedNum}*PTS[v];[v][1:v]paletteuse=dither=${dither}`;
         
         await new Promise((resolve, reject) => {
             ffmpeg()
                 .input(inputPath)
-                .inputOptions([`-ss ${startNum}`, `-t ${duration}`])
+                .inputOptions([`-ss ${startNum}`]) // Seek before input (faster for MP4)
+                .inputOptions([`-t ${duration}`]) // Duration limit
+                .inputOptions(["-threads", "0"]) // Use all available CPU threads
+                .inputOptions(["-vsync", "0"]) // Disable frame sync for speed
+                .inputOptions(["-an"]) // Skip audio (not needed for GIF)
+                .inputOptions(["-sn"]) // Skip subtitles
                 .input(palettePath)
                 .complexFilter(filterComplex)
                 .outputOptions([`-loop ${loopNum}`]) // 0 = infinite, 1 = once, 2 = twice, etc.
                 .outputOptions(["-y"]) // Overwrite output file
+                .outputOptions(["-threads", "0"]) // Use all threads for output
+                .outputOptions(["-gifflags", "+transdiff"]) // Optimize GIF encoding
                 .output(outputPath)
                 .on("start", (commandLine) => {
                     console.log("FFmpeg command:", commandLine);
